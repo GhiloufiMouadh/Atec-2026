@@ -1,0 +1,836 @@
+"""CRATER Sentinel: Deep Space Network ground station (Earth-side receiver).
+
+Run from VS Code or a terminal with:
+    python earth_ground_station.py
+
+This companion script simulates the transmission of the lunar rover's
+telemetry from the Moon to Earth. It:
+
+  * Reads the JSON Lines detection log and mission report written by the
+    rover simulation (robot_simulation.py).
+  * Models realistic one-way light-time delay (~1.28 s), packet framing,
+    checksum verification, and occasional packet loss.
+  * Displays a Mission Control dashboard on Earth showing decoded packets,
+    signal strength, round-trip time, and a decoded event feed.
+  * Writes a decoded Earth-side archive (earth_received_log.jsonl and
+    earth_mission_summary.json) into simulation_data/.
+
+The simulator uses only Python's standard library.
+
+If no rover data exists yet, the ground station will generate a small
+synthetic sample so the dashboard is never empty.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import random
+import sys
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable
+
+try:
+    import tkinter as tk
+    from tkinter import messagebox
+except ImportError:
+    tk = None
+    messagebox = None
+
+
+# ---------------------------------------------------------------------------
+# Paths (shared with the rover simulation)
+# ---------------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_DIRECTORY = PROJECT_ROOT / "simulation_data"
+ROVER_LOG_PATH = DATA_DIRECTORY / "detection_log.jsonl"
+ROVER_REPORT_PATH = DATA_DIRECTORY / "mission_report.json"
+
+EARTH_LOG_PATH = DATA_DIRECTORY / "earth_received_log.jsonl"
+EARTH_SUMMARY_PATH = DATA_DIRECTORY / "earth_mission_summary.json"
+
+# ---------------------------------------------------------------------------
+# Deep Space Network / link budget constants
+# ---------------------------------------------------------------------------
+ONE_WAY_LIGHT_TIME_S = 1.28          # Earth-Moon average one-way light time
+FRAME_INTERVAL_MS = 420              # how fast packets are pushed through the GUI
+PACKET_LOSS_PROBABILITY = 0.04       # ~4% of frames dropped and retransmitted
+RETRANSMIT_DELAY_MS = 1400           # time before a lost frame is resent
+EARTH_STATION = "DSN CANBERRA · DSS-43"
+LUNAR_CRAFT = "L-SCOUT 01"
+BAND = "S-BAND · 2.2 GHz"
+DOWNLINK_RATE_KBPS = 64.0
+
+
+HAZARD_STYLE = {
+    "rock_formation": {"label": "Rock formation", "colour": "#ffb454", "priority": "MEDIUM"},
+    "fissure":        {"label": "Fissure",       "colour": "#ff697f", "priority": "HIGH"},
+    "hole":           {"label": "Lunar hole",    "colour": "#b78cff", "priority": "HIGH"},
+    "dark_spot":      {"label": "Dark spot",     "colour": "#a8bbc8", "priority": "LOW"},
+}
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+@dataclass
+class TelemetryPacket:
+    """One framed, checksummed packet as received on Earth."""
+    frame_id: int
+    received_at_utc: str
+    uplink_sent_at_utc: str
+    one_way_delay_s: float
+    signal_strength_dbm: float
+    checksum_ok: bool
+    retransmitted: bool
+    payload: dict
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def load_rover_records() -> list[dict]:
+    """Load rover detections from JSON Lines, or synthesize a sample."""
+    if ROVER_LOG_PATH.exists():
+        records: list[dict] = []
+        with ROVER_LOG_PATH.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        if records:
+            return records
+
+    # Fallback: build a small synthetic set so the dashboard is never empty.
+    sample_features = [
+        ("RK-01", "rock_formation", 6, 17),
+        ("FS-01", "fissure", 10, 15),
+        ("RK-02", "rock_formation", 16, 12),
+        ("FS-02", "fissure", 20, 9),
+        ("HL-01", "hole", 23, 11),
+        ("DS-01", "dark_spot", 9, 10),
+    ]
+    synthetic: list[dict] = []
+    for index, (fid, ftype, gx, gy) in enumerate(sample_features, start=1):
+        synthetic.append({
+            "sequence": index,
+            "detected_at_utc": _now_utc(),
+            "feature_id": fid,
+            "feature_type": ftype,
+            "priority": HAZARD_STYLE[ftype]["priority"],
+            "grid_coordinate": {"x": gx, "y": gy},
+            "estimated_position_m": {"x": 0.0, "y": 0.0},
+            "confidence": 0.9,
+            "uncertainty_m": 0.4,
+            "rover_distance_m": 5.0 * index,
+        })
+    return synthetic
+
+
+def signal_strength_for(frame_id: int) -> float:
+    """Simulate slowly-varying received signal power (dBm)."""
+    base = -118.0
+    drift = 2.4 * math.sin(frame_id * 0.11)
+    noise = random.uniform(-0.6, 0.6)
+    return round(base + drift + noise, 2)
+
+
+def checksum_of(payload: dict) -> int:
+    """Deterministic checksum over the serialized payload."""
+    raw = json.dumps(payload, sort_keys=True).encode("utf-8")
+    return sum(raw) % 65536
+
+
+def frame_packet(record: dict, frame_id: int, retransmitted: bool) -> TelemetryPacket:
+    """Wrap a rover record into a received telemetry packet."""
+    sent_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return TelemetryPacket(
+        frame_id=frame_id,
+        received_at_utc=_now_utc(),
+        uplink_sent_at_utc=sent_at,
+        one_way_delay_s=ONE_WAY_LIGHT_TIME_S,
+        signal_strength_dbm=signal_strength_for(frame_id),
+        checksum_ok=True,
+        retransmitted=retransmitted,
+        payload=record,
+    )
+
+
+def write_earth_record(packet: TelemetryPacket) -> None:
+    DATA_DIRECTORY.mkdir(exist_ok=True)
+    with EARTH_LOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(asdict(packet)) + "\n")
+
+
+def write_earth_summary(packets: Iterable[TelemetryPacket]) -> None:
+    packet_list = list(packets)
+    DATA_DIRECTORY.mkdir(exist_ok=True)
+    payloads = [packet.payload for packet in packet_list]
+    summary = {
+        "mission": "CRATER Sentinel - Earth-side received archive",
+        "generated_at_utc": _now_utc(),
+        "ground_station": EARTH_STATION,
+        "band": BAND,
+        "one_way_light_time_s": ONE_WAY_LIGHT_TIME_S,
+        "frames_received": len(packet_list),
+        "frames_retransmitted": sum(packet.retransmitted for packet in packet_list),
+        "feature_type_counts": {
+            ftype: sum(1 for payload in payloads if payload.get("feature_type") == ftype)
+            for ftype in ("fissure", "rock_formation", "hole", "dark_spot")
+        },
+        "packets": [asdict(packet) for packet in packet_list],
+    }
+    EARTH_SUMMARY_PATH.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Headless mode
+# ---------------------------------------------------------------------------
+def run_headless_reception() -> list[TelemetryPacket]:
+    """Decode all rover records into framed packets without opening a window."""
+    records = load_rover_records()
+    packets: list[TelemetryPacket] = []
+    rng = random.Random(7)
+    for index, record in enumerate(records, start=1):
+        retransmitted = rng.random() < PACKET_LOSS_PROBABILITY
+        packets.append(frame_packet(record, index, retransmitted))
+    return packets
+
+
+# ---------------------------------------------------------------------------
+# GUI: Earth Mission Control
+# ---------------------------------------------------------------------------
+class EarthGroundStation:
+    """Tkinter Mission Control dashboard for the Earth-side receiver."""
+
+    def __init__(self) -> None:
+        if tk is None:
+            raise RuntimeError("Tkinter is unavailable. Run with --headless instead.")
+        try:
+            self.root = tk.Tk()
+        except tk.TclError as error:
+            raise RuntimeError(
+                "The selected Python interpreter cannot open Tkinter. Use a standard "
+                "Python install with Tcl/Tk support, or run with --headless."
+            ) from error
+
+        self.root.title("CRATER Sentinel | Deep Space Network · Earth Ground Station")
+        self.root.configure(background="#040a14")
+        self.root.resizable(False, False)
+
+        self.records = load_rover_records()
+        self.packets: list[TelemetryPacket] = []
+        self.index = 0
+        self.running = False
+        self.after_id: str | None = None
+        self.rng = random.Random()
+        self.sensor_values: dict[str, tk.Label] = {}
+
+        self._build_interface()
+        self._draw_signal_map()
+        self._refresh_sidebar()
+
+    # ----- UI construction -------------------------------------------------
+    def _build_interface(self) -> None:
+        header = tk.Frame(self.root, bg="#071426", padx=18, pady=12)
+        header.pack(fill="x")
+        title = tk.Frame(header, bg="#071426")
+        title.pack(side="left")
+        tk.Label(title, text="PROJECT C.R.A.T.E.R  /  DEEP SPACE NETWORK", fg="#63d9ff",
+                 bg="#071426", font=("Arial", 9, "bold")).pack(anchor="w")
+        tk.Label(title, text="Earth Ground Station", fg="#edf5ff", bg="#071426",
+                 font=("Arial", 21, "bold")).pack(anchor="w", pady=(1, 0))
+        tk.Label(title, text=f"{EARTH_STATION}  ·  {BAND}  ·  DOWNLINK {DOWNLINK_RATE_KBPS:.0f} kbps",
+                 fg="#9cb0c5", bg="#071426", font=("Arial", 8, "bold")).pack(anchor="w", pady=(2, 0))
+
+        badge = tk.Frame(header, bg="#112e38", padx=12, pady=8)
+        badge.pack(side="right", anchor="ne")
+        tk.Label(badge, text="●  AWAITING DOWNLINK", fg="#85e4b1", bg="#112e38",
+                 font=("Arial", 9, "bold")).pack()
+        tk.Label(badge, text="LUNAR LINK / 384 400 km", fg="#9cb0c5", bg="#112e38",
+                 font=("Consolas", 8)).pack(pady=(2, 0))
+
+        content = tk.Frame(self.root, bg="#040a14", padx=15, pady=15)
+        content.pack(fill="both", expand=True)
+
+        left = tk.Frame(content, bg="#040a14")
+        left.pack(side="left", fill="both", expand=True)
+
+        # Signal map panel
+        signal_panel = tk.Frame(left, bg="#0b1c2e", highlightthickness=1,
+                                highlightbackground="#36516c")
+        signal_panel.pack(fill="both", expand=True)
+        self._panel_title(signal_panel, "EARTH-MOON LINK",
+                          "ONE-WAY LIGHT TIME 1.28 s · LIVE TRACK")
+        self.signal_canvas = tk.Canvas(signal_panel, width=620, height=270,
+                                       bg="#040914", highlightthickness=0)
+        self.signal_canvas.pack(padx=1, pady=(0, 1))
+
+        # Decoded packets panel
+        packets_panel = tk.Frame(left, bg="#0b1c2e", highlightthickness=1,
+                                 highlightbackground="#36516c")
+        packets_panel.pack(fill="both", expand=True, pady=(12, 0))
+        self._panel_title(packets_panel, "DECODED TELEMETRY",
+                          "FRAME VERIFICATION · CHECKSUM OK")
+        self.packets_box = tk.Text(packets_panel, height=12, bg="#040914", fg="#d5e4f4",
+                                   insertbackground="#d5e4f4", relief="flat", wrap="none",
+                                   font=("Consolas", 9), state="disabled")
+        self.packets_box.pack(fill="both", expand=True, padx=1, pady=(0, 1))
+
+        # Right sidebar
+        side = tk.Frame(content, bg="#0b1c2e", width=350, padx=15, pady=14,
+                        highlightthickness=1, highlightbackground="#36516c")
+        side.pack(side="right", fill="both", padx=(14, 0))
+        side.pack_propagate(False)
+
+        self.status_label = tk.Label(side, text="GROUND STATION READY", fg="#85e4b1",
+                                     bg="#0b1c2e", font=("Arial", 10, "bold"))
+        self.status_label.pack(anchor="w")
+        self.position_label = tk.Label(side, text="Frames received: 0 / 0",
+                                       fg="#cbd8e7", bg="#0b1c2e", font=("Consolas", 10))
+        self.position_label.pack(anchor="w", pady=(6, 0))
+        self.metrics_label = tk.Label(
+            side, text="Fissures: 0 · Rocks: 0\nHoles: 0 · Dark spots: 0",
+            fg="#9cb0c5", bg="#0b1c2e", justify="left", font=("Arial", 10))
+        self.metrics_label.pack(anchor="w", pady=(6, 10))
+
+        tk.Label(side, text="LINK & STATION HEALTH", fg="#63d9ff", bg="#0b1c2e",
+                 font=("Arial", 9, "bold")).pack(anchor="w")
+        grid = tk.Frame(side, bg="#0b1c2e")
+        grid.pack(fill="x", pady=(6, 11))
+        for column in range(2):
+            grid.grid_columnconfigure(column, weight=1)
+        self._make_card(grid, "ANTENNA",    0, 0, "70 m · LOCKED", "#63d9ff")
+        self._make_card(grid, "SIGNAL",     0, 1, "-118.0 dBm",   "#63d9ff")
+        self._make_card(grid, "ROUND TRIP", 1, 0, "2.56 s",       "#85e4b1")
+        self._make_card(grid, "FRAME LOSS", 1, 1, "0.0 %",        "#85e4b1")
+        self._make_card(grid, "DOPPLER",    2, 0, "0 Hz · TRACK", "#b78cff")
+        self._make_card(grid, "CLOCK",      2, 1, "UTC · SYNC",   "#b78cff")
+        self._make_card(grid, "POWER",      3, 0, "NOMINAL",      "#ffb454")
+        self._make_card(grid, "ARCHIVE",    3, 1, "0 KB",         "#85e4b1")
+
+        tk.Label(side, text="GROUND STATION LOG", fg="#63d9ff", bg="#0b1c2e",
+                 font=("Arial", 9, "bold")).pack(anchor="w")
+        self.log_box = tk.Text(side, height=9, width=36, bg="#040a14", fg="#d5e4f4",
+                               insertbackground="#d5e4f4", relief="flat", wrap="word",
+                               font=("Consolas", 9), state="disabled")
+        self.log_box.pack(fill="both", expand=True, pady=(7, 11))
+
+        buttons = tk.Frame(side, bg="#0b1c2e")
+        buttons.pack(fill="x")
+        self.start_button = tk.Button(buttons, text="Begin reception",
+                                      command=self.toggle_running, bg="#63d9ff",
+                                      fg="#040a14", relief="flat",
+                                      font=("Arial", 10, "bold"), padx=12, pady=8)
+        self.start_button.pack(side="left", fill="x", expand=True)
+        tk.Button(buttons, text="Reset", command=self.reset, bg="#17324c",
+                  fg="#edf5ff", relief="flat", font=("Arial", 10, "bold"),
+                  padx=12, pady=8).pack(side="left", padx=(8, 0))
+        tk.Button(side, text="Export Earth archive", command=self.export_archive,
+                  bg="#17324c", fg="#edf5ff", relief="flat",
+                  font=("Arial", 10, "bold"), pady=8).pack(fill="x", pady=(8, 0))
+
+        legend = tk.Frame(side, bg="#0b1c2e", pady=10)
+        legend.pack(fill="x")
+        for ftype in ("rock_formation", "fissure", "hole", "dark_spot"):
+            style = HAZARD_STYLE[ftype]
+            tk.Label(legend, text=f"●  {style['label']}  /  {style['priority']}",
+                     fg=style["colour"], bg="#0b1c2e",
+                     font=("Arial", 8, "bold")).pack(anchor="w")
+
+    @staticmethod
+    def _panel_title(parent: tk.Frame, label: str, detail: str) -> None:
+        title = tk.Frame(parent, bg="#0b1c2e", padx=11, pady=7)
+        title.pack(fill="x")
+        tk.Label(title, text=label, fg="#63d9ff", bg="#0b1c2e",
+                 font=("Arial", 9, "bold")).pack(side="left")
+        tk.Label(title, text=detail, fg="#71869a", bg="#0b1c2e",
+                 font=("Consolas", 8)).pack(side="right")
+
+    def _make_card(self, parent: tk.Frame, name: str, row: int, column: int,
+                   initial_value: str, colour: str) -> None:
+        card = tk.Frame(parent, bg="#10283a", padx=8, pady=6)
+        card.grid(row=row, column=column, sticky="nsew", padx=2, pady=2)
+        tk.Label(card, text=name, fg="#9cb0c5", bg="#10283a",
+                 font=("Arial", 7, "bold")).pack(anchor="w")
+        value = tk.Label(card, text=initial_value, fg=colour, bg="#10283a",
+                         font=("Consolas", 8, "bold"))
+        value.pack(anchor="w", pady=(2, 0))
+        self.sensor_values[name] = value
+
+    # ----- drawing ---------------------------------------------------------
+    def _draw_signal_map(self) -> None:
+        canvas = self.signal_canvas
+        canvas.delete("all")
+        width = int(canvas["width"])
+        height = int(canvas["height"])
+
+        # Starfield background
+        rng = random.Random(11)
+        for _ in range(90):
+            x = rng.randint(0, width)
+            y = rng.randint(0, height)
+            canvas.create_oval(x, y, x + 1, y + 1, fill="#8fb6d6", outline="")
+
+        earth_x, earth_y, earth_r = 90, height // 2, 46
+        moon_x, moon_y, moon_r = width - 90, height // 2, 34
+
+        # Earth
+        canvas.create_oval(earth_x - earth_r, earth_y - earth_r,
+                           earth_x + earth_r, earth_y + earth_r,
+                           fill="#1d4a70", outline="#63d9ff", width=2)
+        canvas.create_arc(earth_x - earth_r, earth_y - earth_r,
+                          earth_x + earth_r, earth_y + earth_r,
+                          start=30, extent=140, style="chord",
+                          fill="#2f7f5a", outline="")
+        canvas.create_text(earth_x, earth_y + earth_r + 14, text="EARTH",
+                           fill="#cfe8ff", font=("Arial", 9, "bold"))
+        canvas.create_text(earth_x, earth_y + earth_r + 27, text=EARTH_STATION,
+                           fill="#7f9cb5", font=("Consolas", 7))
+
+        # Moon
+        canvas.create_oval(moon_x - moon_r, moon_y - moon_r,
+                           moon_x + moon_r, moon_y + moon_r,
+                           fill="#8b8f92", outline="#d7dee2", width=2)
+        for cx, cy, cr in ((-10, -6, 7), (8, 4, 5), (-4, 12, 4), (12, -10, 4)):
+            canvas.create_oval(moon_x + cx - cr, moon_y + cy - cr,
+                               moon_x + cx + cr, moon_y + cy + cr,
+                               fill="#6f7477", outline="")
+        canvas.create_text(moon_x, moon_y + moon_r + 14, text="MOON",
+                           fill="#e8f0f4", font=("Arial", 9, "bold"))
+        canvas.create_text(moon_x, moon_y + moon_r + 27, text=LUNAR_CRAFT,
+                           fill="#7f9cb5", font=("Consolas", 7))
+
+        # Downlink beam with animated packets
+        mid_y = height // 2
+        canvas.create_line(earth_x + earth_r, mid_y, moon_x - moon_r, mid_y,
+                           fill="#1f4a63", width=6)
+        canvas.create_line(earth_x + earth_r, mid_y, moon_x - moon_r, mid_y,
+                           fill="#63d9ff", width=1, dash=(4, 6))
+
+        total = max(1, len(self.records))
+        progress = self.index / total
+        for i in range(24):
+            t = i / 23.0
+            px = moon_x - moon_r + (earth_x + earth_r - (moon_x - moon_r)) * t
+            py = mid_y + math.sin(t * math.pi * 4 + self.index * 0.4) * 6
+            travelled = t <= progress
+            colour = "#63d9ff" if travelled else "#2a4a5e"
+            radius = 3 if travelled else 2
+            canvas.create_oval(px - radius, py - radius, px + radius, py + radius,
+                               fill=colour, outline="")
+
+        # Link readouts
+        canvas.create_text(width // 2, 22,
+                           text=f"DOWNLINK  ·  FRAME {self.index:03d} / {total:03d}",
+                           fill="#d5eaf8", font=("Consolas", 9, "bold"))
+        canvas.create_text(width // 2, height - 18,
+                           text=f"ONE-WAY DELAY {ONE_WAY_LIGHT_TIME_S:.2f} s  ·  "
+                                f"ROUND TRIP {ONE_WAY_LIGHT_TIME_S * 2:.2f} s",
+                           fill="#85e4b1", font=("Consolas", 8, "bold"))
+
+    # ----- reception loop --------------------------------------------------
+    def _append_packet_line(self, packet: TelemetryPacket) -> None:
+        payload = packet.payload
+        ftype = payload.get("feature_type", "unknown")
+        style = HAZARD_STYLE.get(ftype, {"label": ftype, "colour": "#d5e4f4"})
+        grid = payload.get("grid_coordinate", {})
+        line = (
+            f"FRAME {packet.frame_id:03d}  {packet.received_at_utc}  "
+            f"{packet.signal_strength_dbm:>7.2f} dBm  "
+            f"{'RETX' if packet.retransmitted else ' OK '}  "
+            f"{style['label'].upper():<14}  "
+            f"({grid.get('x', 0):02d},{grid.get('y', 0):02d})  "
+            f"conf {payload.get('confidence', 0):.2f}\n"
+        )
+        self.packets_box.configure(state="normal")
+        self.packets_box.insert("end", line)
+        self.packets_box.see("end")
+        self.packets_box.configure(state="disabled")
+
+    def _log(self, message: str, colour: str = "#d5e4f4") -> None:
+        stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        self.log_box.configure(state="normal")
+        self.log_box.insert("1.0", f"[{stamp}] {message}\n")
+        self.log_box.configure(state="disabled")
+
+    def _refresh_sidebar(self) -> None:
+        total = len(self.records)
+        self.position_label.configure(text=f"Frames received: {self.index} / {total}")
+
+        payloads = [packet.payload for packet in self.packets]
+        counts = {
+            ftype: sum(1 for p in payloads if p.get("feature_type") == ftype)
+            for ftype in ("fissure", "rock_formation", "hole", "dark_spot")
+        }
+        self.metrics_label.configure(
+            text=(f"Fissures: {counts['fissure']} · Rocks: {counts['rock_formation']}\n"
+                  f"Holes: {counts['hole']} · Dark spots: {counts['dark_spot']}")
+        )
+
+        if self.packets:
+            last = self.packets[-1]
+            self.sensor_values["SIGNAL"].configure(
+                text=f"{last.signal_strength_dbm:.1f} dBm")
+        loss = (sum(p.retransmitted for p in self.packets) / len(self.packets) * 100
+                if self.packets else 0.0)
+        self.sensor_values["FRAME LOSS"].configure(
+            text=f"{loss:.1f} %",
+            fg="#ffb454" if loss > 5 else "#85e4b1")
+        archive_kb = EARTH_LOG_PATH.stat().st_size / 1024 if EARTH_LOG_PATH.exists() else 0.0
+        self.sensor_values["ARCHIVE"].configure(text=f"{archive_kb:.1f} KB")
+
+    def _receive_next(self) -> None:
+        if not self.running:
+            return
+        if self.index >= len(self.records):
+            self.running = False
+            write_earth_summary(self.packets)
+            self.start_button.configure(text="Reception complete", state="disabled")
+            self.status_label.configure(text="DOWNLINK COMPLETE · ARCHIVE SAVED",
+                                        fg="#85e4b1")
+            self._log("Downlink complete. Earth archive written.", "#85e4b1")
+            return
+
+        record = self.records[self.index]
+        retransmitted = self.rng.random() < PACKET_LOSS_PROBABILITY
+        packet = frame_packet(record, self.index + 1, retransmitted)
+        self.packets.append(packet)
+        write_earth_record(packet)
+        self._append_packet_line(packet)
+        self.index += 1
+
+        ftype = record.get("feature_type", "unknown")
+        style = HAZARD_STYLE.get(ftype, {"label": ftype, "colour": "#d5e4f4"})
+        self.status_label.configure(
+            text=f"DECODED: {style['label'].upper()}", fg=style["colour"])
+        if retransmitted:
+            self._log(f"Frame {packet.frame_id} lost — retransmitted and decoded.",
+                      "#ffb454")
+        else:
+            self._log(f"Frame {packet.frame_id} received · checksum OK.", "#85e4b1")
+
+        self._draw_signal_map()
+        self._refresh_sidebar()
+
+        delay = FRAME_INTERVAL_MS + (RETRANSMIT_DELAY_MS if retransmitted else 0)
+        self.after_id = self.root.after(delay, self._receive_next)
+
+    def toggle_running(self) -> None:
+        if self.running:
+            self.running = False
+            if self.after_id:
+                self.root.after_cancel(self.after_id)
+            self.start_button.configure(text="Resume reception")
+            self.status_label.configure(text="RECEPTION PAUSED", fg="#ffb454")
+            self._log("Reception paused by operator.", "#ffb454")
+        else:
+            self.running = True
+            self.start_button.configure(text="Pause reception")
+            self.status_label.configure(text="DOWNLINK ACTIVE", fg="#85e4b1")
+            self._log("Downlink acquisition established.", "#85e4b1")
+            self._receive_next()
+
+    def reset(self) -> None:
+        self.running = False
+        if self.after_id:
+            self.root.after_cancel(self.after_id)
+        self.packets.clear()
+        self.index = 0
+        self.packets_box.configure(state="normal")
+        self.packets_box.delete("1.0", "end")
+        self.packets_box.configure(state="disabled")
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+        self.start_button.configure(text="Begin reception", state="normal")
+        self.status_label.configure(text="GROUND STATION READY", fg="#85e4b1")
+        self._draw_signal_map()
+        self._refresh_sidebar()
+
+    def export_archive(self) -> None:
+        write_earth_summary(self.packets)
+        if messagebox:
+            messagebox.showinfo("Earth archive exported",
+                                f"Saved to:\n{EARTH_SUMMARY_PATH}")
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def main() -> int:
+    if "--headless" in sys.argv:
+        packets = run_headless_reception()
+        write_earth_summary(packets)
+        print(f"Earth ground station received {len(packets)} telemetry frames.")
+        print(f"Archive written to: {EARTH_SUMMARY_PATH}")
+        return 0
+
+    EarthGroundStation().run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+    # ----- realistic space rendering helpers -------------------------------
+    def _draw_nebula(self, canvas: "tk.Canvas", width: int, height: int) -> None:
+        """Paints a soft, layered nebula + Milky Way band for depth."""
+        rng = random.Random(2024)
+
+        # Base deep-space gradient (top to bottom)
+        space_bands = (
+            "#01030a", "#02050e", "#030712", "#04091a",
+            "#050b1e", "#060d20", "#04091a",
+        )
+        band_h = height / len(space_bands)
+        for i, colour in enumerate(space_bands):
+            canvas.create_rectangle(0, i * band_h, width, (i + 1) * band_h,
+                                    fill=colour, outline="")
+
+        # Milky Way diagonal band (soft, multi-pass glow)
+        for offset, colour, thickness in (
+            (-14, "#0a1226", 30),
+            (-6,  "#101a35", 22),
+            (0,   "#182444", 14),
+            (6,   "#101a35", 22),
+            (14,  "#0a1226", 30),
+        ):
+            canvas.create_line(
+                -40, height * 0.72 + offset,
+                width + 40, height * 0.18 + offset,
+                fill=colour, width=thickness,
+            )
+
+        # Nebula clouds (concentric translucent ovals, Tkinter has no alpha,
+        # so we stack darker colours to fake softness)
+        nebulae = (
+            (width * 0.22, height * 0.30, 190, "#0c1830"),
+            (width * 0.20, height * 0.32, 130, "#122344"),
+            (width * 0.24, height * 0.28, 70,  "#1a2f56"),
+            (width * 0.78, height * 0.72, 220, "#0e1a2e"),
+            (width * 0.80, height * 0.74, 150, "#142645"),
+            (width * 0.76, height * 0.70, 80,  "#1c3159"),
+            (width * 0.52, height * 0.55, 160, "#0a1526"),
+            (width * 0.50, height * 0.56, 90,  "#0f1d33"),
+        )
+        for cx, cy, r, colour in nebulae:
+            canvas.create_oval(cx - r, cy - r * 0.6, cx + r, cy + r * 0.6,
+                               fill=colour, outline="")
+
+        # Faint dust specks across the nebula
+        for _ in range(220):
+            x = rng.randint(0, width)
+            y = rng.randint(0, height)
+            shade = rng.choice(("#2a3a5c", "#223252", "#1a2745", "#33436a"))
+            canvas.create_oval(x, y, x + 1, y + 1, fill=shade, outline="")
+
+    def _draw_starfield(self, canvas: "tk.Canvas", width: int, height: int) -> None:
+        """Layered starfield: distant faint stars, mid stars, bright stars."""
+        rng = random.Random(91)
+
+        # Layer 1: distant faint stars
+        for _ in range(400):
+            x = rng.randint(0, width)
+            y = rng.randint(0, height)
+            shade = rng.choice(("#445c7a", "#3a5069", "#506a88"))
+            canvas.create_oval(x, y, x + 1, y + 1, fill=shade, outline="")
+
+        # Layer 2: mid-brightness stars
+        for _ in range(160):
+            x = rng.randint(0, width)
+            y = rng.randint(0, height)
+            shade = rng.choice(("#9ab6d4", "#b6cbe2", "#8ea9c7"))
+            canvas.create_oval(x, y, x + 1, y + 1, fill=shade, outline="")
+
+        # Layer 3: bright stars with a 4-point sparkle cross
+        for _ in range(30):
+            x = rng.randint(6, width - 6)
+            y = rng.randint(6, height - 6)
+            size = rng.choice((1, 1, 2, 2, 3))
+            canvas.create_oval(x - size, y - size, x + size, y + size,
+                               fill="#f0f6ff", outline="")
+            # sparkle rays
+            ray = size + 3
+            canvas.create_line(x - ray, y, x + ray, y,
+                               fill="#c8dcf2", width=1)
+            canvas.create_line(x, y - ray, x, y + ray,
+                               fill="#c8dcf2", width=1)
+            # faint coloured halo (red / blue giants)
+            halo_colour = rng.choice(("#5a7fb8", "#b88a6a", "#7aa8c9", "#c9b58a"))
+            canvas.create_oval(x - size - 2, y - size - 2,
+                               x + size + 2, y + size + 2,
+                               outline=halo_colour, width=1)
+
+    def _draw_earth(self, canvas: "tk.Canvas", cx: int, cy: int, r: int) -> None:
+        """Photorealistic Earth: atmosphere, oceans, continents, clouds, night side."""
+        # --- Outer atmospheric glow (stacked rings for softness) ---
+        for i, colour in enumerate(("#0a2038", "#0d2a4a", "#10365e", "#144273")):
+            gr = r + 10 - i * 2
+            canvas.create_oval(cx - gr, cy - gr, cx + gr, cy + gr,
+                               outline=colour, width=2)
+
+        # --- Ocean sphere ---
+        canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                           fill="#0f3a63", outline="#3a7fc0", width=2)
+
+        # --- Continent blobs (Africa/America/Asia shaped approximations) ---
+        # Africa-ish
+        canvas.create_polygon(
+            cx - 2, cy - 22,
+            cx + 6, cy - 16,
+            cx + 10, cy - 4,
+            cx + 6, cy + 10,
+            cx - 2, cy + 20,
+            cx - 8, cy + 14,
+            cx - 10, cy + 2,
+            cx - 7, cy - 12,
+            fill="#2f7a4a", outline="#3f9a60", width=1,
+        )
+        # Europe/Asia-ish
+        canvas.create_polygon(
+            cx + 6, cy - 26,
+            cx + 24, cy - 22,
+            cx + 30, cy - 10,
+            cx + 22, cy - 2,
+            cx + 14, cy - 6,
+            cx + 8, cy - 14,
+            fill="#3a8a52", outline="#4aa368", width=1,
+        )
+        # Americas-ish (left side, partial)
+        canvas.create_polygon(
+            cx - 30, cy - 14,
+            cx - 20, cy - 18,
+            cx - 14, cy - 6,
+            cx - 16, cy + 8,
+            cx - 22, cy + 18,
+            cx - 30, cy + 12,
+            cx - 34, cy + 0,
+            fill="#2f7a4a", outline="#3f9a60", width=1,
+        )
+        # Southern landmass (Antarctica hint)
+        canvas.create_polygon(
+            cx - 14, cy + 26,
+            cx + 10, cy + 24,
+            cx + 16, cy + 30,
+            cx - 18, cy + 32,
+            fill="#d8e6ef", outline="#eaf2f8", width=1,
+        )
+
+        # --- Cloud swirls (thin white arcs, layered) ---
+        cloud_paths = (
+            (-r * 0.6, -r * 0.4, -r * 0.1, -r * 0.55),
+            (r * 0.05, -r * 0.6,  r * 0.5, -r * 0.35),
+            (-r * 0.4,  r * 0.15, r * 0.1,  r * 0.05),
+            (r * 0.15,  r * 0.35, r * 0.6,  r * 0.25),
+            (-r * 0.7,  r * 0.45, -r * 0.2, r * 0.5),
+        )
+        for x1, y1, x2, y2 in cloud_paths:
+            canvas.create_line(cx + x1, cy + y1, cx + x2, cy + y2,
+                               fill="#e8f2fb", width=3, smooth=True)
+
+        # --- Terminator (day/night shadow on the right side) ---
+        canvas.create_arc(cx - r, cy - r, cx + r, cy + r,
+                          start=250, extent=160, style="chord",
+                          fill="#05101c", outline="")
+        # Soft terminator blend
+        canvas.create_arc(cx - r + 3, cy - r + 3, cx + r - 3, cy + r - 3,
+                          start=255, extent=150, style="arc",
+                          outline="#0a1a2c", width=4)
+
+        # --- Specular highlight (sun reflection on ocean) ---
+        canvas.create_oval(cx - r * 0.55, cy - r * 0.65,
+                           cx - r * 0.15, cy - r * 0.25,
+                           fill="#7ec4f0", outline="")
+
+        # --- Thin bright rim light on the lit side ---
+        canvas.create_arc(cx - r, cy - r, cx + r, cy + r,
+                          start=110, extent=140, style="arc",
+                          outline="#bfe3ff", width=2)
+
+    def _draw_moon(self, canvas: "tk.Canvas", cx: int, cy: int, r: int) -> None:
+        """Detailed Moon: maria, craters with rims, subtle terminator."""
+        # --- Base sphere ---
+        canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                           fill="#9a9a96", outline="#c8c8c4", width=2)
+
+        # --- Maria (dark basalt plains) ---
+        maria = (
+            (-10, -6, 12, 8),
+            (10, 2, 9, 6),
+            (-2, 12, 7, 5),
+            (14, -10, 6, 4),
+            (-14, 6, 5, 4),
+        )
+        for mx, my, mw, mh in maria:
+            canvas.create_oval(cx + mx - mw, cy + my - mh,
+                               cx + mx + mw, cy + my + mh,
+                               fill="#6e6e6a", outline="")
+
+        # --- Craters (deterministic pseudo-random placement) ---
+        rng = random.Random(77)
+        for _ in range(28):
+            angle = rng.uniform(0, math.tau)
+            dist = rng.uniform(0, r * 0.85)
+            ox = math.cos(angle) * dist
+            oy = math.sin(angle) * dist
+            cr = rng.uniform(1.5, 4.5)
+
+            # crater floor
+            canvas.create_oval(cx + ox - cr, cy + oy - cr,
+                               cx + ox + cr, cy + oy + cr,
+                               fill="#7a7a76", outline="")
+            # bright rim (sunlit edge)
+            canvas.create_arc(cx + ox - cr, cy + oy - cr,
+                              cx + ox + cr, cy + oy + cr,
+                              start=200, extent=140, style="arc",
+                              outline="#d8d8d4", width=1)
+            # shadow crescent (interior)
+            canvas.create_arc(cx + ox - cr + 1, cy + oy - cr + 1,
+                              cx + ox + cr - 1, cy + oy + cr - 1,
+                              start=20, extent=120, style="arc",
+                              outline="#4a4a48", width=1)
+
+        # --- A few larger, prominent craters with ray systems ---
+        for (ox, oy, cr) in ((-18, -14, 6), (16, 10, 7), (-6, 20, 5)):
+            canvas.create_oval(cx + ox - cr, cy + oy - cr,
+                               cx + ox + cr, cy + oy + cr,
+                               fill="#84847f", outline="#e0e0da", width=1)
+            canvas.create_oval(cx + ox - cr * 0.55, cy + oy - cr * 0.55,
+                               cx + ox + cr * 0.55, cy + oy + cr * 0.55,
+                               fill="#5f5f5b", outline="")
+            # rays
+            for k in range(6):
+                a = k * (math.tau / 6) + 0.3
+                canvas.create_line(
+                    cx + ox + math.cos(a) * cr,
+                    cy + oy + math.sin(a) * cr,
+                    cx + ox + math.cos(a) * (cr + 6),
+                    cy + oy + math.sin(a) * (cr + 6),
+                    fill="#c8c8c2", width=1,
+                )
+
+        # --- Terminator (right side shadow) ---
+        canvas.create_arc(cx - r, cy - r, cx + r, cy + r,
+                          start=250, extent=160, style="chord",
+                          fill="#1c1c1a", outline="")
+        canvas.create_arc(cx - r + 3, cy - r + 3, cx + r - 3, cy + r - 3,
+                          start=255, extent=150, style="arc",
+                          outline="#2c2c28", width=4)
+
+        # --- Rim light on the lit side ---
+        canvas.create_arc(cx - r, cy - r, cx + r, cy + r,
+                          start=110, extent=140, style="arc",
+                          outline="#f0f0ea", width=2)
